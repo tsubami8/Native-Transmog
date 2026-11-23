@@ -65,6 +65,17 @@ static char g_our_desc[] = "\xe8\xae\xb0\xe5\xbd\x95\xe5\xbd\x93\xe5\x89\x8d\xe7
                            "\xe5\xa4\x96\xe8\xa7\x82\xef\xbc\x8c\xe6\x8d\xa2\xe8\xa3\x85\xe5\x90\x8e\xe4\xbb\x8d\xe4\xbf\x9d\xe6\x8c\x81";
 static const char register_appearance_desc[] = "\xe8\xaf\xb7\xe9\x80\x89\xe6\x8b\xa9\xe7\x99\xbb\xe8\xae\xb0\xe4\xbd\x8d\xe7\xbd\xae\xe3\x80\x82";
 #define REGISTER_APPEARANCE_MESSAGE 0x7ff2u
+#define KINSECT_APPEARANCE_MESSAGE 0x7ff3u
+static const char kinsect_desc[] = "\xe8\xaf\xb7\xe9\x80\x89\xe6\x8b\xa9\xe8\xa6\x81\xe6\x98\xbe\xe7\xa4\xba\xe7\x9a\x84\xe7\x8c\x8e\xe8\x99\xab\xe5\xa4\x96\xe8\xa7\x82\xe3\x80\x82";
+
+#define WEAPON_BOX_MESSAGE 0x7ff4u
+static const char *const weapon_box_descriptions[] = {
+    "\xe4\xbb\x8e\xe8\xa3\x85\xe5\xa4\x87\xe7\xae\xb1\xe9\x80\x89\xe6\x8b\xa9\xe4\xb8\x8e\xe5\xbd\x93\xe5\x89\x8d\xe6\xad\xa6\xe5\x99\xa8\xe5\x90\x8c\xe7\xa7\x8d\xe7\xb1\xbb\xe7\x9a\x84\xe6\xad\xa6\xe5\x99\xa8\xe4\xbd\x9c\xe4\xb8\xba\xe5\xa4\x96\xe8\xa7\x82\xe3\x80\x82",
+    "\xe6\x81\xa2\xe5\xa4\x8d\xe5\xbd\x93\xe5\x89\x8d\xe6\xad\xa6\xe5\x99\xa8\xe7\x9a\x84\xe5\x8e\x9f\xe7\x94\x9f\xe5\xa4\x96\xe8\xa7\x82\xe3\x80\x82",
+    "\xe4\xbb\x8e\xe5\x90\x8d\xe5\x8d\x95\xe9\x80\x89\xe6\x8b\xa9\xe8\xa6\x81\xe6\x98\xbe\xe7\xa4\xba\xe7\x9a\x84\xe7\x8c\x8e\xe8\x99\xab\xe5\xa4\x96\xe8\xa7\x82\xe3\x80\x82",
+    "\xe6\x81\xa2\xe5\xa4\x8d\xe5\xbd\x93\xe5\x89\x8d\xe7\x8c\x8e\xe8\x99\xab\xe7\x9a\x84\xe5\x8e\x9f\xe7\x94\x9f\xe5\xa4\x96\xe8\xa7\x82\xe3\x80\x82",
+    "\xe8\xa3\x85\xe5\xa4\x87\xe6\x93\x8d\xe8\x99\xab\xe6\xa3\x8d\xe5\x90\x8e\xe5\x8f\xaf\xe4\xbd\xbf\xe7\x94\xa8\xe6\xad\xa4\xe9\x80\x89\xe9\xa1\xb9\xe3\x80\x82",
+};
 
 static int key_match(const char *p, const char *key, int len) {
     for (int i = 0; i < len; i++) if (p[i] != key[i]) return 0;
@@ -242,6 +253,11 @@ static uint32_t msg_detour(uint32_t mgr, uint32_t kind, uint32_t file, uint32_t 
     if (kind == 0 && file == 9 && id == 0x7ff1) return (uint32_t)(uintptr_t)g_our_desc;
     if (kind == 1 && file == 0x16 && id == REGISTER_APPEARANCE_MESSAGE)
         return (uint32_t)(uintptr_t)register_appearance_desc;
+    if (kind == 1 && file == 0x16 && id == KINSECT_APPEARANCE_MESSAGE)
+        return (uint32_t)(uintptr_t)kinsect_desc;
+    if (kind == 1 && file == 0x16 && id >= WEAPON_BOX_MESSAGE &&
+        id - WEAPON_BOX_MESSAGE < sizeof weapon_box_descriptions / sizeof *weapon_box_descriptions)
+        return (uint32_t)(uintptr_t)weapon_box_descriptions[id - WEAPON_BOX_MESSAGE];
     return g_msg(mgr, kind, file, id);
 }
 
@@ -392,6 +408,122 @@ static uint32_t hunter_item(uint32_t type, uint16_t id) {
     return catalog ? ((uint32_t (*)(uint32_t, uint32_t, uint32_t))0x33c208u)(catalog, type, id) : 0;
 }
 
+#define INSECT_GLAIVE_TYPE 20u
+#define WEAPON_PART 7u
+#define SECOND_WEAPON_PART 8u
+#define KINSECT_COUNT 31u
+#define HUNTER_PROFILE_COUNT 3u
+#define G_SAVE_MANAGER 0x1a8c76cu
+
+typedef struct {
+    uint32_t equipped_key;
+    uint16_t weapon_id;
+    uint16_t kinsect_id;
+} WeaponAppearance;
+
+static WeaponAppearance weapon_appearances[HUNTER_PROFILE_COUNT];
+static const char weapon_appearance_path[] = "savedata:/layered_weapon.bin";
+static int weapon_save_pending;
+static unsigned weapon_save_delay;
+
+static int is_weapon_type(unsigned type) {
+    return type >= 7 && type <= 21 && type != 12;
+}
+
+static uint32_t equipped_weapon_key(void) {
+    uint32_t player = LD32(G_PLAYER_MANAGER);
+    uint32_t box = LD32(G_EQUIP_BOX);
+    if (!player || !box) return 0;
+    uint32_t index = LD16(player + PLAYER_EQUIP);
+    if (index >= MAX_IDX) return 0;
+    uint32_t record = box + BOX_RECORDS + index * REC_STRIDE + ENTRY_OFF;
+    unsigned type = LD16(record) & 0x1f;
+    uint16_t id = LD16(record + 2);
+    // The slot distinguishes duplicate weapons. Level, dyes and the attached
+    // kinsect are deliberately excluded so native kinsect exchanges keep the look.
+    return is_weapon_type(type) && id ? ((uint32_t)id << 16) | (type << 11) | (index + 1) : 0;
+}
+
+static unsigned weapon_key_type(uint32_t key) {
+    return (key >> 11) & 0x1f;
+}
+
+static WeaponAppearance *current_weapon_appearance(void) {
+    uint32_t manager = LD32(G_SAVE_MANAGER);
+    if (!manager) return 0;
+    unsigned profile = LD32(manager + 64);
+    return profile < HUNTER_PROFILE_COUNT ? &weapon_appearances[profile] : 0;
+}
+
+static int save_weapon_appearances(void) {
+    if (save_record(weapon_appearance_path, weapon_appearances, sizeof weapon_appearances,
+                    0, sizeof weapon_appearances)) {
+        weapon_save_pending = 0;
+        return 1;
+    }
+    LOG("[layered] weapon appearance save failed\n");
+    return 0;
+}
+
+static WeaponAppearance *sync_weapon_appearance(uint32_t key) {
+    WeaponAppearance *appearance = current_weapon_appearance();
+    if (appearance && appearance->equipped_key && appearance->equipped_key != key) {
+        *appearance = (WeaponAppearance){0};
+        weapon_save_pending = 1;
+        LOG("[layered] cleared weapon and kinsect appearances after equipment change\n");
+    }
+    return appearance;
+}
+
+static int set_weapon_appearance(uint32_t key, uint16_t id, int kinsect) {
+    WeaponAppearance *appearance = sync_weapon_appearance(key);
+    if (!appearance || !key) return 0;
+    WeaponAppearance previous = *appearance;
+    appearance->equipped_key = key;
+    if (kinsect) appearance->kinsect_id = id;
+    else appearance->weapon_id = id;
+    if (!appearance->weapon_id && !appearance->kinsect_id) appearance->equipped_key = 0;
+    if (!save_weapon_appearances()) {
+        *appearance = previous;
+        return 0;
+    }
+    hunter_refresh |= 1;
+    return 1;
+}
+
+static uint32_t kinsect_data(unsigned id) {
+    uint32_t catalog = gear_catalog();
+    if (!catalog || !id || id > KINSECT_COUNT) return 0;
+    return ((uint32_t (*)(uint32_t, uint32_t))0x33f518u)(catalog, id);
+}
+
+static const char *kinsect_name(unsigned id) {
+    uint32_t entry = kinsect_data(id);
+    uint32_t messages = LD32(0x1a56b64u);
+    if (!entry || !messages) return "";
+    const char *name = ((const char *(*)(uint32_t, uint32_t))0xd84114u)(messages, LD32(entry + 0x34));
+    return name ? name : "";
+}
+
+static int weapon_has_second_part(unsigned type) {
+    return type > 7 && type <= 21 && (0x3745u & (1u << (type - 8)));
+}
+
+static uint32_t weapon_model(uint32_t actor, uint32_t part, uint32_t stock) {
+    uint32_t key = equipped_weapon_key();
+    WeaponAppearance *appearance = current_weapon_appearance();
+    if (!key || !appearance || appearance->equipped_key != key) return stock;
+    unsigned type = weapon_key_type(key);
+    uint32_t equip = LD32(actor + 0x13c4);
+    if (!equip || LD8(equip + 0x4d4) != type - 7) return stock;
+    if (part == SECOND_WEAPON_PART && type == INSECT_GLAIVE_TYPE) {
+        uint32_t entry = kinsect_data(appearance->kinsect_id);
+        return entry ? LD32(entry + 0xc) : stock;
+    }
+    uint32_t item = appearance->weapon_id ? hunter_item(type, appearance->weapon_id) : 0;
+    return item ? equipment_model(item) : stock;
+}
+
 static int model_idle(uint32_t actor, uint32_t part) {
     uint32_t object = LD32(actor + 0x2384 + 4 * part);
     return object && LD32(object + 0x1378) <= 1;
@@ -463,13 +595,17 @@ static uint32_t model_request_detour(uint32_t actor, uint32_t part, uint32_t mod
                 break;
             }
         }
-    } else if (part <= 4 && is_local_hunter(actor)) {
-        for (unsigned i = 0; i < 5; i++) {
-            if (hunter_parts[i] == part && cosmetic[i]) {
-                uint32_t item = hunter_item(i + 1, cosmetic[i]);
-                if (item) model = equipment_model(item);
-                break;
+    } else if (is_local_hunter(actor)) {
+        if (part <= 4) {
+            for (unsigned i = 0; i < 5; i++) {
+                if (hunter_parts[i] == part && cosmetic[i]) {
+                    uint32_t item = hunter_item(i + 1, cosmetic[i]);
+                    if (item) model = equipment_model(item);
+                    break;
+                }
             }
+        } else if ((part == WEAPON_PART || part == SECOND_WEAPON_PART) && model != UINT32_MAX) {
+            model = weapon_model(actor, part, model);
         }
     }
     return g_model_request(actor, part, model);
@@ -487,7 +623,12 @@ static uint32_t equip_update_detour(uint32_t actor) {
                     cat_refresh[slot] &= (uint8_t)~(1u << i);
                 }
             }
-        } else if (hunter_refresh && is_local_hunter(actor)) {
+        } else if (is_local_hunter(actor)) {
+            uint32_t key = equipped_weapon_key();
+            sync_weapon_appearance(key);
+            if ((hunter_refresh & 1) && key && model_idle(actor, WEAPON_PART) &&
+                (!weapon_has_second_part(weapon_key_type(key)) || model_idle(actor, SECOND_WEAPON_PART)))
+                ready |= 1;
             for (unsigned i = 0; i < 5; i++) {
                 if ((hunter_refresh & (2u << i)) && model_idle(actor, hunter_parts[i]))
                     ready |= 2u << i;
@@ -592,10 +733,10 @@ static void box_set_visible(uint32_t panel, uint32_t rows) {
     ST32(panel + 0x5c, cap);
 }
 
-static void box_draw_row(uint32_t panel, uint32_t row, const char *label, int focused) {
+static void box_draw_row(uint32_t panel, uint32_t row, const char *label, int focused, int enabled) {
     uint32_t node = LD32(BOX_NODES + 4 * row);
     ((void (*)(uint32_t, uint32_t, uint32_t, uint32_t))FN_LABEL)(panel, node, 1, (uint32_t)(uintptr_t)label);
-    uint32_t col = ((uint32_t (*)(uint32_t, uint32_t, uint32_t, uint32_t))FN_COLOR)(1, focused ? 1 : 0, 0, 0);
+    uint32_t col = ((uint32_t (*)(uint32_t, uint32_t, uint32_t, uint32_t))FN_COLOR)(enabled, focused != 0, 0, 0);
     ((void (*)(uint32_t, uint32_t, uint32_t, uint32_t))FN_PAINT)(panel, node, 1, col);
 }
 
@@ -664,7 +805,8 @@ static uint32_t attach_page_counter(uint32_t panel, uint32_t selector) {
     return widget;
 }
 
-static void draw_page_indicator(uint32_t panel, uint32_t sel, PageIndicator *indicator, int root) {
+static void draw_page_indicator(uint32_t panel, uint32_t sel, PageIndicator *indicator,
+                                int root, int paged) {
     uint32_t display = (uint32_t)(uintptr_t)indicator->selector;
     uint32_t widget = page_counter(panel, display);
     if (root) {
@@ -674,10 +816,16 @@ static void draw_page_indicator(uint32_t panel, uint32_t sel, PageIndicator *ind
     }
     if (!widget || !LD8(widget + 0x18)) return;
     ST16(display + 16, indicator->page);
-    ST16(display + 18, 2);
+    ST16(display + 18, paged ? 2 : 1);
     ST32(display + 4, root ? 0 : 1);
     ST32(display + 8, indicator->flash > 4 ? (indicator->left ? 4 : 8) : 0);
     ((void (*)(uint32_t))0x800ec8u)(widget);
+    // The shared GUI resets instance visibility when the next item box opens.
+    // Keep the borrowed arrows outside the canvas until a paged box uses them.
+    uint32_t gui = LD32(widget + 0x24);
+    float y = paged ? 22.0f : -1024.0f;
+    ((NodePosition)0x745ac0u)(gui, LD32(widget + 0x5c), y);
+    ((NodePosition)0x745ac0u)(gui, LD32(widget + 0x60), y);
 }
 
 static uint32_t update_page_indicator(uint32_t (*update)(uint32_t), uint32_t ui, uint32_t input,
@@ -753,14 +901,14 @@ static void draw_board_page(uint32_t panel) {
     uint32_t ui = sel - BOARD_SEL;
     if (LD32(ui) != BOARD_VTABLE) return;
     int root = LD32(ui + BOARD_STATE) == 1 && LD16(sel + 20) == 9;
-    draw_page_indicator(panel, sel, &board_indicator, root);
+    draw_page_indicator(panel, sel, &board_indicator, root, 1);
     if (!root && LD16(sel + 20) != 9) return;
     unsigned page = LD16(sel + 16);
     uint32_t visible = root && page == 1 ? 1 : 8;
     if (LD32(panel + 0x64) != visible)
         ((void (*)(uint32_t, uint32_t))FN_VISIBLE)(panel, visible);
     if (root) {
-        if (page == 1) box_draw_row(panel, 0, g_our_label, 1);
+        if (page == 1) box_draw_row(panel, 0, g_our_label, 1, 1);
     }
 }
 
@@ -788,6 +936,7 @@ typedef struct {
 static PresetStore presets;
 static PresetStore preset_draft;
 static uint32_t preset_ui;
+static int kinsect_picker;
 static int preset_native_names;
 static int preset_renaming;
 static PresetAction preset_action;
@@ -796,6 +945,7 @@ static unsigned confirm_slot = NO_PRESET;
 static const char preset_path[] = "savedata:/layered_presets.bin";
 static const char preset_legacy_path[] = "savedata:/layered_sets.ini";
 static const char preset_title[] = "\xe5\xb9\xbb\xe5\x8c\x96\xe4\xb8\xaa\xe4\xba\xba\xe7\xbb\x84\xe5\x90\x88";
+static const char kinsect_title[] = "\xe7\x8c\x8e\xe8\x99\xab\xe5\xb9\xbb\xe5\x8c\x96";
 static const char *const preset_actions[] = {
     "\xe8\xa3\x85\xe5\xa4\x87\xe5\xb9\xbb\xe5\x8c\x96\xe7\xbb\x84\xe5\x90\x88", "\xe7\x99\xbb\xe8\xae\xb0\xe5\xb9\xbb\xe5\x8c\x96\xe7\xbb\x84\xe5\x90\x88", "\xe7\xa7\xbb\xe5\x8a\xa8\xe5\xb9\xbb\xe5\x8c\x96\xe7\xbb\x84\xe5\x90\x88", "\xe8\xa7\xa3\xe9\x99\xa4\xe5\xb9\xbb\xe5\x8c\x96\xe7\xbb\x84\xe5\x90\x88"
 };
@@ -872,7 +1022,7 @@ static const char *preset_name(unsigned slot) {
 
 static uint32_t get_set_name_detour(uint32_t box, uint32_t slot) {
     if (preset_native_names && box == LD32(G_EQUIP_BOX) && slot < PRESET_COUNT)
-        return (uint32_t)(uintptr_t)preset_name(slot);
+        return (uint32_t)(uintptr_t)(kinsect_picker ? kinsect_name(slot + 1) : preset_name(slot));
     return g_get_set_name(box, slot);
 }
 
@@ -898,16 +1048,29 @@ static void preview_set_detour(uint32_t ui, uint32_t slot) {
     if (ui != preset_ui) g_preview_set(ui, slot);
 }
 
+static unsigned preset_page(uint32_t ui) {
+    return LD16(ui + 0x2e8);
+}
+
+static void set_kinsect_last_row(uint32_t panel, int visible) {
+    uint32_t gui = LD32(panel + 0x24);
+    // menu_common_down: last button (11), last separator in Anm_line (13),
+    // and Anm_Window_main (14). A 36-pixel row uses 1.8 window scale units.
+    ((void (*)(uint32_t, uint32_t, uint32_t))0x74533cu)(gui, 11, visible);
+    ((void (*)(uint32_t, uint32_t, uint32_t, uint32_t))0x76e530u)(panel, 13, 9, visible);
+    ((NodePosition)0x7460ecu)(gui, 14, visible ? 16.8f : 15.0f);
+}
+
 static void draw_set_list_detour(uint32_t panel) {
     int replace_title = preset_ui && (LD8(panel + 0x54) & 1) &&
                         box_widget(preset_ui, PRESET_PANEL) == panel;
     g_draw_preset_list(panel);
-    if (replace_title)
-        ((void (*)(uint32_t, uint32_t, uint32_t, const char *))FN_LABEL)(panel, 2, 3, preset_title);
-}
-
-static unsigned preset_page(uint32_t ui) {
-    return LD16(ui + 0x2e8);
+    if (replace_title) {
+        ((void (*)(uint32_t, uint32_t, uint32_t, const char *))FN_LABEL)
+            (panel, 2, 3, kinsect_picker ? kinsect_title : preset_title);
+        if (kinsect_picker)
+            set_kinsect_last_row(panel, (preset_page(preset_ui) + 1) * PRESETS_PER_PAGE <= KINSECT_COUNT);
+    }
 }
 
 static unsigned preset_index(uint32_t ui) {
@@ -924,11 +1087,11 @@ static void refresh_preset_rows(uint32_t ui) {
     for (unsigned row = 0; row < PRESETS_PER_PAGE; row++) {
         unsigned slot = page * PRESETS_PER_PAGE + row;
         char *name = (char *)(uintptr_t)(ui + 0x59c + 0x2c * row);
-        const char *source = preset_name(slot);
+        const char *source = kinsect_picker ? kinsect_name(slot + 1) : preset_name(slot);
         memset(name, 0, 0x2c);
         for (unsigned i = 0; i + 1 < PRESET_NAME_CAPACITY && source[i]; i++) name[i] = source[i];
-        name[0x2a] = 1;
-        name[0x2b] = slot == move_source;
+        name[0x2a] = !kinsect_picker || slot < KINSECT_COUNT;
+        name[0x2b] = !kinsect_picker && slot == move_source;
     }
     uint32_t panel = box_widget(ui, PRESET_PANEL);
     if (panel) ST32(panel + 0x54, LD32(panel + 0x54) | 1);
@@ -951,6 +1114,11 @@ static void preset_guide(uint32_t ui) {
     preset_message(ui, message, 0);
     // The stock guide for a slot with no equipment preview still offers Change Name.
     ((void (*)(uint32_t, uint32_t, uint32_t, uint32_t))0x918a0cu)(ui, 0x28, 1, 1);
+}
+
+static void kinsect_guide(uint32_t ui) {
+    preset_message(ui, KINSECT_APPEARANCE_MESSAGE, 0);
+    ((void (*)(uint32_t, uint32_t, uint32_t, uint32_t))0x918a0cu)(ui, 0x29, 1, 1);
 }
 
 static void apply_preset_slot(uint32_t ui, unsigned slot) {
@@ -1022,24 +1190,69 @@ static void update_preset_confirm(uint32_t ui, uint32_t pressed) {
     preset_guide(ui);
 }
 
+static void set_preset_capacity(uint32_t ui, unsigned count) {
+    ST16(ui + PRESET_SELECTOR + 0x1a, (count + PRESETS_PER_PAGE - 1) / PRESETS_PER_PAGE);
+    ST16(ui + PRESET_SELECTOR + 0x1c, count);
+}
+
+static void restore_kinsect_list(uint32_t ui) {
+    uint32_t panel = box_widget(ui, PRESET_PANEL);
+    if (panel) set_kinsect_last_row(panel, 1);
+    set_preset_capacity(ui, PRESET_COUNT);
+}
+
 static void open_preset_slots(uint32_t ui, PresetAction action) {
     static const uint32_t open_list[] = {0x925f0cu, 0x92604cu, 0x9261a0u, 0x926280u};
     preset_action = action;
     move_source = confirm_slot = NO_PRESET;
+    set_preset_capacity(ui, kinsect_picker ? KINSECT_COUNT : PRESET_COUNT);
     preset_native_names = 1;
     ((void (*)(uint32_t))open_list[action])(ui);
     preset_native_names = 0;
     ST32(ui + 0x5c, 2);
     ((void (*)(uint32_t, uint32_t))0x85cc0cu)(ui, 0);
     refresh_preset_rows(ui);
-    preset_guide(ui);
+    if (kinsect_picker) kinsect_guide(ui);
+    else preset_guide(ui);
     menu_sound(0, SND_DIRECT);
+}
+
+static void update_preset_cursor(uint32_t ui, uint32_t input, uint32_t pressed) {
+    uint32_t repeated = input ? LD32(input + INPUT_REPEAT - INPUT_PRESSED) : 0;
+    uint32_t buttons = pressed | repeated;
+    if (pressed & BUTTON_ZL) buttons |= DPAD_LEFT;
+    if (pressed & BUTTON_ZR) buttons |= DPAD_RIGHT;
+    unsigned slot = preset_index(ui);
+    ((void (*)(uint32_t, uint32_t))0x7530b8u)(ui + PRESET_SELECTOR, buttons);
+    if (slot != preset_index(ui)) refresh_preset_rows(ui);
+}
+
+static uint32_t update_kinsect_picker(uint32_t ui, uint32_t input, uint32_t pressed) {
+    uint32_t key = equipped_weapon_key();
+    if ((pressed & BUTTON_B) || weapon_key_type(key) != INSECT_GLAIVE_TYPE) {
+        ((void (*)(uint32_t))0x926e7cu)(ui);
+        restore_kinsect_list(ui);
+        // Finish the native submenu cancellation on the same update.
+        return input ? with_button(g_update_set_menu, ui, input, BUTTON_B, 0) : 1;
+    }
+    if (pressed & BUTTON_A) {
+        unsigned id = preset_index(ui) + 1;
+        if (kinsect_data(id) && set_weapon_appearance(key, (uint16_t)id, 1)) {
+            menu_sound(1, SND_EQUIP);
+            LOG("[layered] applied kinsect appearance %u\n", id);
+        } else menu_sound(0, SND_ERROR);
+    } else {
+        update_preset_cursor(ui, input, pressed);
+    }
+    kinsect_guide(ui);
+    return 1;
 }
 
 static uint32_t update_set_menu_detour(uint32_t ui) {
     if (ui != preset_ui) return g_update_set_menu(ui);
     uint32_t input = input_address();
     uint32_t pressed = input ? LD32(input) : 0;
+    if (kinsect_picker) return update_kinsect_picker(ui, input, pressed);
     if (LD32(ui + 0x5c) == 1) {
         if ((pressed & (BUTTON_A | BUTTON_B)) != BUTTON_A) return g_update_set_menu(ui);
         unsigned row = LD8(ui + 0x15d);
@@ -1090,12 +1303,7 @@ static uint32_t update_set_menu_detour(uint32_t ui) {
         preset_native_names = 0;
         menu_sound(0, SND_DIRECT);
     } else {
-        uint32_t repeated = input ? LD32(input + INPUT_REPEAT - INPUT_PRESSED) : 0;
-        uint32_t buttons = pressed | repeated;
-        if (pressed & BUTTON_ZL) buttons |= DPAD_LEFT;
-        if (pressed & BUTTON_ZR) buttons |= DPAD_RIGHT;
-        ((void (*)(uint32_t, uint32_t))0x7530b8u)(ui + PRESET_SELECTOR, buttons);
-        if (slot != preset_index(ui)) refresh_preset_rows(ui);
+        update_preset_cursor(ui, input, pressed);
     }
     preset_guide(ui);
     return 1;
@@ -1106,6 +1314,50 @@ static uint32_t capture_box_ui;
 static int g_drive;
 static int box_return;
 static uint32_t (*g_hunter_grid)(uint32_t);
+static void (*g_equipment_icon)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+
+typedef enum {
+    BOX_ARMOR, BOX_PRESETS, BOX_RESTORE_ARMOR, BOX_WEAPON, BOX_RESTORE_WEAPON,
+    BOX_KINSECT, BOX_RESTORE_KINSECT, BOX_APPEARANCE_ROWS
+} AppearanceBoxRow;
+
+static const char *const appearance_box_labels[] = {
+    g_our_label, preset_title, hunter_restore,
+    "\xe6\xad\xa6\xe5\x99\xa8\xe5\xb9\xbb\xe5\x8c\x96", "\xe8\xbf\x98\xe5\x8e\x9f\xe6\xad\xa6\xe5\x99\xa8\xe5\xa4\x96\xe8\xa7\x82",
+    kinsect_title, "\xe8\xbf\x98\xe5\x8e\x9f\xe7\x8c\x8e\xe8\x99\xab\xe5\xa4\x96\xe8\xa7\x82",
+};
+static AppearanceBoxRow capture_row;
+
+static int weapon_donor_matches(uint32_t weapon, uint32_t entry) {
+    return weapon && entry && (LD16(entry) & 0x1f) == weapon_key_type(weapon) && LD16(entry + 2);
+}
+
+static void equipment_icon_detour(uint32_t widget, uint32_t group, uint32_t node,
+                                  uint32_t record, uint32_t style, uint32_t flags) {
+    // Native equipment filters send 0 for unavailable grid icons.
+    if (capture_box_ui && capture_row == BOX_WEAPON && group == 12 &&
+        LD32(widget + 0x58) == capture_box_ui + 0x174 && record &&
+        !weapon_donor_matches(equipped_weapon_key(), record + ENTRY_OFF))
+        flags = 0;
+    g_equipment_icon(widget, group, node, record, style, flags);
+}
+
+static int appearance_row_enabled(AppearanceBoxRow row, uint32_t weapon) {
+    if (row == BOX_KINSECT || row == BOX_RESTORE_KINSECT)
+        return weapon_key_type(weapon) == INSECT_GLAIVE_TYPE;
+    if (row == BOX_WEAPON) return weapon && g_equipment_icon;
+    if (row == BOX_RESTORE_WEAPON) return weapon != 0;
+    return 1;
+}
+
+static void draw_appearance_box_rows(uint32_t panel, unsigned selected) {
+    uint32_t weapon = equipped_weapon_key();
+    box_set_visible(panel, BOX_APPEARANCE_ROWS);
+    for (unsigned row = 0; row < BOX_APPEARANCE_ROWS; row++) {
+        box_draw_row(panel, row, appearance_box_labels[row], row == selected,
+                     appearance_row_enabled((AppearanceBoxRow)row, weapon));
+    }
+}
 
 static uint32_t hunter_grid_detour(uint32_t ui) {
     uint32_t input = input_address();
@@ -1123,6 +1375,16 @@ static uint32_t hunter_grid_detour(uint32_t ui) {
     }
     uint32_t record = box + BOX_RECORDS + index * REC_STRIDE + ENTRY_OFF;
     uint32_t type = LD16(record) & 0x1f;
+    if (capture_row == BOX_WEAPON) {
+        uint32_t weapon = equipped_weapon_key();
+        uint16_t id = LD16(record + 2);
+        if (weapon_donor_matches(weapon, record) && hunter_item(type, id) &&
+            set_weapon_appearance(weapon, id, 0)) {
+            menu_sound(1, SND_EQUIP);
+            LOG("[layered] applied weapon appearance type=%u id=%u (box index %u)\n", type, id, index);
+        } else menu_sound(0, SND_ERROR);
+        return 1;
+    }
     uint16_t id = LD16(record + APP_OFF);
     if (!id) id = LD16(record + 2);
     if (type < 1 || type > 5 || !id || !hunter_item(type, id)) {
@@ -1151,23 +1413,35 @@ static uint32_t boxupd_detour(uint32_t ui) {
     uint32_t state = LD32(ui + 0x40);
     uint32_t panel = box_widget(ui, 0);
     uint32_t sel = ui + BOX_SEL;
-    int root = state == 1 && panel && LD32(panel + 0x5c) == 9;
+    int root = state == 1 && panel && LD32(panel + 0x5c) == 9 && LD32(ui + 0x3c) != 1;
     if (root && LD16(sel + 20) == 9 && LD8(sel + 14) == 9) {
-        ((void (*)(uint32_t, uint32_t, uint32_t))FN_SEL_COUNT)(sel, 12, PAGE_INPUT_DPAD);
+        ((void (*)(uint32_t, uint32_t, uint32_t))FN_SEL_COUNT)(sel, 9 + BOX_APPEARANCE_ROWS, PAGE_INPUT_DPAD);
         LOG("[layered] item box appearance entries enabled\n");
     }
-    int root_ready = root && LD16(sel + 20) == 12;
+    int root_ready = root && LD16(sel + 20) == 9 + BOX_APPEARANCE_ROWS;
+
+    if (root_ready) {
+        g_box_ui = ui;
+        g_box_panel = panel;
+    } else if (g_box_ui == ui && state != 3) {
+        // The next item box can reuse this GUI after the borrowed widget is destroyed.
+        if (panel == g_box_panel) draw_page_indicator(panel, sel, &box_indicator, 0, 0);
+        g_box_ui = 0;
+        g_box_panel = 0;
+    }
 
     if (ui == preset_ui && (root_ready || state == 0 || state == 4)) {
+        if (root_ready) restore_box_root(ui, kinsect_picker ? BOX_KINSECT : BOX_PRESETS);
+        if (kinsect_picker) restore_kinsect_list(ui);
         preset_ui = 0;
         preset_renaming = 0;
-        if (root_ready) restore_box_root(ui, 1);
+        kinsect_picker = 0;
     }
     if (ui == capture_box_ui) {
         if (root_ready || state == 0 || state == 4) {
             capture_box_ui = 0;
             g_drive = box_return = 0;
-            if (root_ready) restore_box_root(ui, 0);
+            if (root_ready) restore_box_root(ui, capture_row);
         } else if (state == 3 && input) {
             if (box_return) {
                 return with_button(g_boxupd, ui, input, BUTTON_B, 1);
@@ -1183,44 +1457,71 @@ static uint32_t boxupd_detour(uint32_t ui) {
         }
     }
     if (root) {
-        g_box_ui = ui;
-        g_box_panel = panel;
         if (root_ready && LD16(sel + 16) == 1 &&
             (pressed & (BUTTON_A | BUTTON_B)) == BUTTON_A) {
-            unsigned row = LD8(sel + 13);
-            if (row == 2) {
+            AppearanceBoxRow row = (AppearanceBoxRow)LD8(sel + 13);
+            uint32_t weapon = equipped_weapon_key();
+            if (row >= BOX_APPEARANCE_ROWS || !appearance_row_enabled(row, weapon)) {
+                menu_sound(0, SND_ERROR);
+                return 0;
+            }
+            if (row == BOX_RESTORE_ARMOR) {
                 const uint16_t native[5] = {0};
                 if (set_current(native)) {
                     menu_sound(0, SND_DIRECT);
                 }
                 return 0;
             }
-            if (row == 1 && (!g_get_set_name || !g_set_set_name || !g_update_set_menu || !g_preview_set)) {
+            if (row == BOX_RESTORE_WEAPON || row == BOX_RESTORE_KINSECT) {
+                if (set_weapon_appearance(weapon, 0, row == BOX_RESTORE_KINSECT)) {
+                    menu_sound(0, SND_DIRECT);
+                    LOG("[layered] restored %s appearance\n", row == BOX_RESTORE_KINSECT ? "kinsect" : "weapon");
+                } else menu_sound(0, SND_ERROR);
+                return 0;
+            }
+            int use_list = row == BOX_PRESETS || row == BOX_KINSECT;
+            if (use_list && (!g_get_set_name || !g_set_set_name || !g_update_set_menu || !g_preview_set)) {
                 menu_sound(0, SND_ERROR);
                 return 0;
             }
-            unsigned native_row = row == 1 ? 6 : 5;
+            unsigned native_row = use_list ? 6 : 5;
             ST16(sel + 16, 0);
             ST8(sel + 13, native_row);
             ST32(ui + 0x70, native_row);
             box_set_visible(panel, 9);
-            if (row == 1) preset_ui = ui;
-            uint32_t result = with_button(g_boxupd, ui, input, BUTTON_A, row == 0);
-            if (row == 1) {
-                if (LD32(ui + 0x40) != 3 || LD32(ui + 0x74) != 6) preset_ui = 0;
-                else restore_root_selection(sel, 1);
+            if (use_list) {
+                preset_ui = ui;
+                kinsect_picker = row == BOX_KINSECT;
+            }
+            uint32_t result = with_button(g_boxupd, ui, input, BUTTON_A, row != BOX_PRESETS);
+            if (use_list) {
+                if (LD32(ui + 0x40) != 3 || LD32(ui + 0x74) != 6) {
+                    preset_ui = 0;
+                    kinsect_picker = 0;
+                } else {
+                    restore_root_selection(sel, row);
+                    if (kinsect_picker) open_preset_slots(ui, REGISTER_PRESET);
+                }
             } else if (LD32(ui + 0x40) == 3) {
                 capture_box_ui = ui;
+                capture_row = row;
                 g_drive = 1;
                 box_return = 0;
             }
             return result;
         }
-        if (root_ready)
-            return update_page_indicator(g_boxupd, ui, input, sel, &box_indicator);
-    } else if (g_box_ui == ui) {
-        g_box_ui = 0;
-        g_box_panel = 0;
+        if (root_ready) {
+            uint32_t result = update_page_indicator(g_boxupd, ui, input, sel, &box_indicator);
+            unsigned row = LD8(sel + 13);
+            if (LD32(ui + 0x40) == 1 && LD16(sel + 16) == 1 && row >= BOX_WEAPON &&
+                row < BOX_APPEARANCE_ROWS) {
+                unsigned hint = row - BOX_WEAPON;
+                if (row >= BOX_KINSECT && !appearance_row_enabled((AppearanceBoxRow)row, equipped_weapon_key()))
+                    hint = 4;
+                preset_message(ui, WEAPON_BOX_MESSAGE + hint, 0);
+            }
+            return result;
+        }
     }
     return g_boxupd(ui);
 }
@@ -1245,29 +1546,24 @@ static uint32_t boxdraw_detour(uint32_t panel) {
     if (!panel) return result;
     draw_board_page(panel);
     uint32_t sel = LD32(panel + 0x54);
-    int root = panel == g_box_panel && g_box_ui && LD32(g_box_ui + 0x40) == 1 &&
-               sel == g_box_ui + BOX_SEL && LD16(sel + 20) == 12;
-    draw_page_indicator(panel, sel, &box_indicator, root);
+    unsigned state = g_box_ui && panel == g_box_panel ? LD32(g_box_ui + 0x40) : 0;
+    int paged = (state == 1 || state == 3) && sel == g_box_ui + BOX_SEL &&
+                LD32(panel + 0x5c) == 9 && LD16(sel + 20) == 9 + BOX_APPEARANCE_ROWS;
+    int root = paged && state == 1;
+    draw_page_indicator(panel, sel, &box_indicator, root, paged);
 
-    int preset_submenu = preset_ui && LD32(preset_ui + 0x40) == 3 &&
+    int preset_submenu = preset_ui && !kinsect_picker && LD32(preset_ui + 0x40) == 3 &&
                          LD32(preset_ui + 0x5c) == 1 && box_widget(preset_ui, 0) == panel;
     if (preset_submenu) {
-        box_set_visible(panel, 3);
         set_menu_title(panel, g_box_title);
-        box_draw_row(panel, 0, g_our_label, 0);
-        box_draw_row(panel, 1, preset_title, 0);
-        box_draw_row(panel, 2, hunter_restore, 0);
+        draw_appearance_box_rows(panel, UINT32_MAX);
         draw_preset_submenu(panel);
         return result;
     }
     if (!root) return result;
     unsigned page = LD16(sel + 16);
     if (page == 1) {
-        unsigned row = LD8(sel + 13);
-        box_set_visible(panel, 3);
-        box_draw_row(panel, 0, g_our_label, row == 0);
-        box_draw_row(panel, 1, preset_title, row == 1);
-        box_draw_row(panel, 2, hunter_restore, row == 2);
+        draw_appearance_box_rows(panel, LD8(sel + 13));
     } else {
         box_set_visible(panel, 9);
     }
@@ -1281,6 +1577,7 @@ static int game_supported(void) {
         {0x946050u, 0xe92d48f0u, 0xe1a04000u}, // Board update
         {0x94a3a8u, 0xe92d4ff0u, 0xe24dd024u}, // Palico equipment selection
         {0x9201ccu, 0xe92d4ff0u, 0xe24dd014u}, // Hunter equipment selection
+        {0x76ea38u, 0xe92d4bf0u, 0xe24dd010u}, // Equipment grid icon
         {0x4899fcu, 0xe92d4070u, 0xe1a05001u}, // Model request
         {0x4861f0u, 0xe92d4ff0u, 0xe24ddf59u}, // Equipment model refresh
     };
@@ -1323,6 +1620,7 @@ void forge_onInit(void) {
         }
     }
     load_presets();
+    load_file(weapon_appearance_path, weapon_appearances, sizeof weapon_appearances);
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x74f260u, (void *)menu_sound_detour, (void **)&g_menu_sound); (void)h; }
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x9182f4u, (void *)update_set_menu_detour, (void **)&g_update_set_menu); (void)h; }
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x346408u, (void *)get_set_name_detour, (void **)&g_get_set_name); (void)h; }
@@ -1332,6 +1630,7 @@ void forge_onInit(void) {
     { ForgeHook uh = forge_hook_create((void *)(uintptr_t)0x86ed24u, (void *)update_detour, (void **)&g_update); (void)uh; }
     { ForgeHook bh = forge_hook_create((void *)(uintptr_t)FN_BOX_UPDATE, (void *)boxupd_detour, (void **)&g_boxupd); (void)bh; }
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x9201ccu, (void *)hunter_grid_detour, (void **)&g_hunter_grid); (void)h; }
+    { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x76ea38u, (void *)equipment_icon_detour, (void **)&g_equipment_icon); (void)h; }
     { ForgeHook dh = forge_hook_create((void *)(uintptr_t)0x7c1fa4u, (void *)boxdraw_detour, (void **)&g_boxdraw); (void)dh; }
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x946050u, (void *)board_update_detour, (void **)&g_board_update); (void)h; }
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x94a3a8u, (void *)board_grid_detour, (void **)&g_board_grid); (void)h; }
@@ -1350,6 +1649,8 @@ void forge_onUpdate(float dt) {
     if (!g_model_request) return;
     if (board_indicator.flash) board_indicator.flash--;
     if (box_indicator.flash) box_indicator.flash--;
+    if (weapon_save_delay) weapon_save_delay--;
+    if (weapon_save_pending && !weapon_save_delay && !save_weapon_appearances()) weapon_save_delay = 120;
     static int prev_r3;
     int r3 = forge_input_isPressed(5);
     if (r3 && !prev_r3) mark_current();
