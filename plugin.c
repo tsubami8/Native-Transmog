@@ -38,6 +38,9 @@ extern ForgeHook forge_hook_create(void *target, void *detour, void **original);
 #define APP_OFF 0x4u
 #define PLAYER_EQUIP 0x84u
 #define MAX_IDX 2000u
+#define HUNTER_PROFILE_COUNT 3u
+#define TITLE_UPDATE 0x87b544u
+#define TITLE_SAVE_SELECT 0x13u
 
 void *memcpy(void *d, const void *s, size_t n) {
     uint8_t *p = d;
@@ -394,6 +397,26 @@ static int is_local_hunter(uint32_t actor) {
     return index < 4 && LD32(manager + 0x1c + 4 * index) == actor;
 }
 
+static uint32_t (*g_title_update)(uint32_t);
+static uint32_t title_save_select;
+
+static uint32_t title_update_detour(uint32_t ui) {
+    title_save_select = LD8(ui + 4) == TITLE_SAVE_SELECT ? ui : 0;
+    uint32_t result = g_title_update(ui);
+    if (title_save_select && LD8(ui + 4) != TITLE_SAVE_SELECT) title_save_select = 0;
+    return result;
+}
+
+static int title_preview_slot(uint32_t actor) {
+    if (!title_save_select || LD32(actor + 0x13c8) != 2) return -1;
+    uint32_t manager = LD32(G_PLAYER_MANAGER);
+    // Character Select uses the manager's separate preview actor and equipment.
+    if (!manager || LD32(manager + 0x2c) != actor ||
+        LD32(actor + 0x13c4) != manager + 0x30dc) return -1;
+    unsigned slot = LD8(title_save_select + 0x3d);
+    return slot < HUNTER_PROFILE_COUNT ? (int)slot : -1;
+}
+
 static uint32_t gear_catalog(void) {
     return LD32(0x1a56b18u);
 }
@@ -412,7 +435,6 @@ static uint32_t hunter_item(uint32_t type, uint16_t id) {
 #define WEAPON_PART 7u
 #define SECOND_WEAPON_PART 8u
 #define KINSECT_COUNT 31u
-#define HUNTER_PROFILE_COUNT 3u
 #define G_SAVE_MANAGER 0x1a8c76cu
 
 typedef struct {
@@ -430,18 +452,32 @@ static int is_weapon_type(unsigned type) {
     return type >= 7 && type <= 21 && type != 12;
 }
 
-static uint32_t equipped_weapon_key(void) {
-    uint32_t player = LD32(G_PLAYER_MANAGER);
-    uint32_t box = LD32(G_EQUIP_BOX);
-    if (!player || !box) return 0;
-    uint32_t index = LD16(player + PLAYER_EQUIP);
+static uint32_t weapon_key(unsigned index, uint32_t record) {
     if (index >= MAX_IDX) return 0;
-    uint32_t record = box + BOX_RECORDS + index * REC_STRIDE + ENTRY_OFF;
     unsigned type = LD16(record) & 0x1f;
     uint16_t id = LD16(record + 2);
     // The slot distinguishes duplicate weapons. Level, dyes and the attached
     // kinsect are deliberately excluded so native kinsect exchanges keep the look.
     return is_weapon_type(type) && id ? ((uint32_t)id << 16) | (type << 11) | (index + 1) : 0;
+}
+
+static uint32_t equipped_weapon_key(void) {
+    uint32_t player = LD32(G_PLAYER_MANAGER);
+    uint32_t box = LD32(G_EQUIP_BOX);
+    if (!player || !box) return 0;
+    unsigned index = LD16(player + PLAYER_EQUIP);
+    return weapon_key(index, box + BOX_RECORDS + index * REC_STRIDE + ENTRY_OFF);
+}
+
+static uint32_t preview_weapon_key(unsigned slot, uint32_t equip) {
+    uint32_t manager = LD32(G_SAVE_MANAGER);
+    if (!manager || LD32(manager + 0x2c + 4 * slot) != 1) return 0;
+    uint32_t save = LD32(manager + 0x28);
+    if (!save || !LD8(save + 4 + slot)) return 0;
+    uint32_t character = save + LD32(save + 0x10 + 4 * slot);
+    // The preview has a copy of the equipped record. Its original equipment
+    // box index comes from this hunter's saved equipment slots.
+    return weapon_key(LD16(character + 0x21db0), equip + 0x1c);
 }
 
 static unsigned weapon_key_type(uint32_t key) {
@@ -509,12 +545,10 @@ static int weapon_has_second_part(unsigned type) {
     return type > 7 && type <= 21 && (0x3745u & (1u << (type - 8)));
 }
 
-static uint32_t weapon_model(uint32_t actor, uint32_t part, uint32_t stock) {
-    uint32_t key = equipped_weapon_key();
-    WeaponAppearance *appearance = current_weapon_appearance();
+static uint32_t weapon_model(uint32_t equip, uint32_t part, uint32_t stock,
+                             uint32_t key, const WeaponAppearance *appearance) {
     if (!key || !appearance || appearance->equipped_key != key) return stock;
     unsigned type = weapon_key_type(key);
-    uint32_t equip = LD32(actor + 0x13c4);
     if (!equip || LD8(equip + 0x4d4) != type - 7) return stock;
     if (part == SECOND_WEAPON_PART && type == INSECT_GLAIVE_TYPE) {
         uint32_t entry = kinsect_data(appearance->kinsect_id);
@@ -595,7 +629,9 @@ static uint32_t model_request_detour(uint32_t actor, uint32_t part, uint32_t mod
                 break;
             }
         }
-    } else if (is_local_hunter(actor)) {
+    } else {
+        int preview = title_preview_slot(actor);
+        if (preview < 0 && !is_local_hunter(actor)) return g_model_request(actor, part, model);
         if (part <= 4) {
             for (unsigned i = 0; i < 5; i++) {
                 if (hunter_parts[i] == part && cosmetic[i]) {
@@ -605,7 +641,11 @@ static uint32_t model_request_detour(uint32_t actor, uint32_t part, uint32_t mod
                 }
             }
         } else if ((part == WEAPON_PART || part == SECOND_WEAPON_PART) && model != UINT32_MAX) {
-            model = weapon_model(actor, part, model);
+            uint32_t equip = LD32(actor + 0x13c4);
+            uint32_t key = preview >= 0 ? preview_weapon_key((unsigned)preview, equip) : equipped_weapon_key();
+            const WeaponAppearance *appearance = preview >= 0 ?
+                &weapon_appearances[preview] : current_weapon_appearance();
+            model = weapon_model(equip, part, model, key, appearance);
         }
     }
     return g_model_request(actor, part, model);
@@ -1621,6 +1661,12 @@ void forge_onInit(void) {
     }
     load_presets();
     load_file(weapon_appearance_path, weapon_appearances, sizeof weapon_appearances);
+    if (LD32(TITLE_UPDATE) == 0xe92d47f0u && LD32(TITLE_UPDATE + 4) == 0xe24ddf42u) {
+        ForgeHook h = forge_hook_create((void *)(uintptr_t)TITLE_UPDATE, (void *)title_update_detour,
+                                        (void **)&g_title_update);
+        (void)h;
+    }
+    if (!g_title_update) LOG("[layered] Character Select preview hook unavailable\n");
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x74f260u, (void *)menu_sound_detour, (void **)&g_menu_sound); (void)h; }
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x9182f4u, (void *)update_set_menu_detour, (void **)&g_update_set_menu); (void)h; }
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x346408u, (void *)get_set_name_detour, (void **)&g_get_set_name); (void)h; }
