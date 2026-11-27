@@ -31,6 +31,7 @@ extern ForgeHook forge_hook_create(void *target, void *detour, void **original);
 
 #define G_EQUIP_BOX 0x1a56fe8u
 #define G_PLAYER_MANAGER 0x1a85b58u
+#define G_FESTA_NETWORK 0x1a843f0u
 #define G_SESSION 0x1a8ca48u
 #define BOX_RECORDS 0x1cu
 #define REC_STRIDE 0x2cu
@@ -41,6 +42,13 @@ extern ForgeHook forge_hook_create(void *target, void *detour, void **original);
 #define HUNTER_PROFILE_COUNT 3u
 #define TITLE_UPDATE 0x87b544u
 #define TITLE_SAVE_SELECT 0x13u
+#define NET_PLAYER_DATA_INIT 0x4025bcu
+#define NET_PLAYER_DATA_BROADCAST 0x4026a0u
+#define NET_PLAYER_DATA_UNICAST 0x4027c8u
+#define PLAYER_STATUS_COPY 0x46e600u
+#define PLAYER_STATUS_LOCAL 0x7cu
+#define PLAYER_STATUS_GEAR 0x18u
+#define NET_PLAYER_DATA_DIRTY 0x42e474u
 
 void *memcpy(void *d, const void *s, size_t n) {
     uint8_t *p = d;
@@ -62,6 +70,8 @@ int memcmp(const void *a, const void *b, size_t n) {
 static uint16_t cosmetic[5];
 static uint8_t hunter_refresh;
 static void mark_current(void);
+static uint32_t (*g_player_status_copy)(uint32_t, uint32_t);
+static void (*queue_player_data)(uint32_t);
 
 static char g_our_label[] = "\xe5\xa4\x96\xe8\xa7\x82\xe8\xa3\x85\xe5\xa4\x87";  // 外观装备
 static char g_our_desc[] = "\xe8\xae\xb0\xe5\xbd\x95\xe5\xbd\x93\xe5\x89\x8d\xe7\xa9\xbf\xe7\x9d\x80\xe7\x9a\x84"
@@ -376,10 +386,15 @@ static int set_current(const uint16_t ids[5]) {
         menu_sound(0, SND_ERROR);
         return 0;
     }
+    int changed = memcmp(cosmetic, ids, sizeof cosmetic) != 0;
     for (unsigned i = 0; i < 5; i++) {
         if (ids[i] != cosmetic[i]) hunter_refresh |= (uint8_t)(1u << (i + 1));
     }
     memcpy(cosmetic, ids, sizeof cosmetic);
+    if (changed && queue_player_data) {
+        uint32_t network = LD32(G_FESTA_NETWORK);
+        if (network) queue_player_data(network);
+    }
     return 1;
 }
 
@@ -429,6 +444,32 @@ static uint32_t equipment_model(uint32_t item) {
 static uint32_t hunter_item(uint32_t type, uint16_t id) {
     uint32_t catalog = gear_catalog();
     return catalog ? ((uint32_t (*)(uint32_t, uint32_t, uint32_t))0x33c208u)(catalog, type, id) : 0;
+}
+
+static uint32_t player_status_copy_detour(uint32_t destination, uint32_t source) {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    uint32_t result = g_player_status_copy(destination, source);
+    switch (caller) {
+    case NET_PLAYER_DATA_INIT + 4:
+    case NET_PLAYER_DATA_BROADCAST + 4:
+    case NET_PLAYER_DATA_UNICAST + 4:
+        break;
+    default:
+        return result;
+    }
+
+    uint32_t player = LD32(G_PLAYER_MANAGER);
+    if (source != player + PLAYER_STATUS_LOCAL) return result;
+
+    // The three callers build outgoing netPlData messages. Only the armor
+    // appearance fields in that copy are sent to the other clients.
+    for (unsigned type = 1; type <= 5; type++) {
+        uint32_t record = destination + PLAYER_STATUS_GEAR + type * REC_STRIDE + ENTRY_OFF;
+        uint16_t appearance = cosmetic[type - 1];
+        if (appearance && (LD16(record) & 0x1f) == type && LD16(record + 2) && hunter_item(type, appearance))
+            ST16(record + APP_OFF, appearance);
+    }
+    return result;
 }
 
 #define INSECT_GLAIVE_TYPE 20u
@@ -1667,6 +1708,16 @@ void forge_onInit(void) {
         (void)h;
     }
     if (!g_title_update) LOG("[layered] Character Select preview hook unavailable\n");
+    if (LD32(PLAYER_STATUS_COPY) == 0xe92d4070u && LD32(PLAYER_STATUS_COPY + 4) == 0xe1a05001u &&
+        LD32(NET_PLAYER_DATA_INIT) == 0xeb01b00fu && LD32(NET_PLAYER_DATA_BROADCAST) == 0xeb01afd6u &&
+        LD32(NET_PLAYER_DATA_UNICAST) == 0xeb01af8cu) {
+        ForgeHook h = forge_hook_create((void *)(uintptr_t)PLAYER_STATUS_COPY, (void *)player_status_copy_detour,
+                                        (void **)&g_player_status_copy);
+        (void)h;
+    }
+    if (!g_player_status_copy) LOG("[layered] multiplayer armor sync hook unavailable\n");
+    else if (LD32(NET_PLAYER_DATA_DIRTY) == 0xe306125au && LD32(NET_PLAYER_DATA_DIRTY + 4) == 0xe3a02001u)
+        queue_player_data = (void (*)(uint32_t))NET_PLAYER_DATA_DIRTY;
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x74f260u, (void *)menu_sound_detour, (void **)&g_menu_sound); (void)h; }
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x9182f4u, (void *)update_set_menu_detour, (void **)&g_update_set_menu); (void)h; }
     { ForgeHook h = forge_hook_create((void *)(uintptr_t)0x346408u, (void *)get_set_name_detour, (void **)&g_get_set_name); (void)h; }
